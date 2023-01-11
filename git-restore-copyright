@@ -1,0 +1,177 @@
+#!/usr/bin/env python
+# Copyright (C) 2023 Pyarelal Knowles - MIT (see LICENSE)
+import argparse
+import os
+import sys
+import re
+import io
+import codecs
+import fileinput
+import datetime
+from git import Repo
+
+copyright_pattern = re.compile(r'copyright\s*(?:©|\(c\))\s*(?P<start>[0-9]{4})(?:\s*\-\s*(?P<end>[0-9]{4}))?', re.I)
+
+parser = argparse.ArgumentParser(description='Mass-restore copyrights in a git repository')
+parser.add_argument('op', choices=['restore', 'undo', 'history'], help='Either "restore" copyright year(s) from this commit, "undo" its changes or replace them using the date from their first git "history" commit.')
+parser.add_argument('commit', help='Commit-ish to "restore" from or "undo". Only checks files indexed at this commit for "history".')
+parser.add_argument('-n', '--dry-run', action='store_true', help='Print the replacements that would have been made but do not modify the files.')
+parser.add_argument('-l', '--lines', nargs='?', default=10, type=int, help='Number of lines to search in file headers for a copyright notice with a year')
+parser.add_argument('-v', '--verbose', action='store_true', help='List the files that are being inspected')
+parser.add_argument('--expand-range', action='store_true', help='Rather than just restore "2023" to the original year "2014", replace it with a range covering all years, e.g. "2014 - 2023".')
+args = parser.parse_args()
+
+repo = Repo()
+assert not repo.bare
+assert not repo.is_dirty()
+
+def replace_copyright_line(line, start, end):
+    # DANGER: stdout writes to the file. use stderr only
+    new_line = line
+    m = copyright_pattern.search(line)
+    if m is not None:
+        if m.group(2) is None:
+            if end is None:
+                if args.expand_range:
+                    start = str(min(int(start), int(m.group(1))))
+                    end = str(max(int(start), int(m.group(1))))
+                    if end == start: end = None
+                if end is None:
+                    # 2014 -> 2023
+                    # replace with 2014
+                    new_line = line[:m.start(1)] + start + line[m.end(1):]
+                else:
+                    # 2014 -> 2023
+                    # replace with 2014 - 2023
+                    new_line = line[:m.start(1)] + "{}-{}".format(start, end) + line[m.end(1):]
+            else:
+                if args.expand_range:
+                    # 2014 - 2022 -> 2023
+                    # replace with 2014 - 2023
+                    start = str(min(int(start), int(m.group(1))))
+                    end = str(max(int(end), int(m.group(1))))
+                new_line = line[:m.start(1)] + "{}-{}".format(start, end) + line[m.end(1):]
+        else:
+            if end is None and args.expand_range:
+                # 2014 -> 2021 - 2022
+                # replace with 2014 - 2022
+                start = str(min(int(start), int(m.group(1))))
+                end = str(max(int(start), int(m.group(2))))
+            if end is None:
+                # 2014 -> 2021 - 2022
+                # replace with 2014 because --expand-range was not given
+                new_line = line[:m.start(1)] + start + line[m.end(2):]
+            else:
+                if args.expand_range:
+                    # 2014 - 2022 -> 2021 - 2023
+                    # replace with 2014 - 2023
+                    start = str(min(int(start), int(m.group(1))))
+                    end = str(max(int(end), int(m.group(2))))
+                new_line = line[:m.start(1)] + start + line[m.end(1):m.start(2)] + end + line[m.end(2):]
+    return (m is not None, line, new_line)
+
+def replace_copyright(filepath, start, end):
+    # DANGER: stdout writes to the file within this loop
+    result = None
+    replaced = False
+    replacing = not args.dry_run
+    for i, line in enumerate(fileinput.input(filepath, inplace=replacing)):
+        # Stop replacing after the first replacement
+        if not replaced and i < args.lines:
+            try:
+                result = replace_copyright_line(line, start, end)
+                replaced = result[0]
+                line = result[2]
+            except Exception as e:
+                if replacing:
+                    # Do not interrupt re-writing the file
+                    print(e, file=sys.stderr)
+                else:
+                    raise e
+        if replacing:
+            # Must print the entire file as it is being overwritten
+            print(line, end='')
+    return result
+
+def tree_exists(tree, path):
+    try:
+        tree.join(path)
+        return True
+    except KeyError:
+        return False
+
+if args.op == 'history':
+    # pydriller needed to follow file renames
+    from pydriller import Repository
+
+copyrights_replaced = 0
+commit = repo.commit(args.commit)
+if args.op == 'undo':
+    #TODO: do this properly with a diff
+    print('Warning: "undo" is currently just restoring to the parent commit and does not filter the changes made by the specific commit', file=sys.stderr)
+    # Get all the files from the parent commit that were touched in the target commit
+    # Note: this skips files added by the commit to undo
+    parent_tree = commit.parents[0].tree
+    files = [parent_tree[filepath] for filepath in commit.stats.files if tree_exists(parent_tree, filepath)]
+else:
+    # Get all the files/"blob"s in the target commit
+    files = [obj for obj in commit.tree.traverse() if obj.type == "blob"]
+for file in files:
+    filepath = file.path
+    abs_filepath = os.path.join(repo.working_tree_dir, filepath)
+    if args.verbose: print(filepath, file=sys.stderr, end='')
+    if not os.path.isfile(abs_filepath):
+        if args.verbose: print(" (Not currently a file)", file=sys.stderr)
+        continue
+    found_copyright = False
+    start = None
+    end = None
+    orig_line = None
+    if args.op == 'history':
+        # First make sure the current file has a copyright
+        m = None
+        with open(abs_filepath) as ifile:
+            try:
+                for i, line in enumerate(ifile):
+                    if i >= args.lines: break
+                    m = copyright_pattern.search(line)
+                    if m: break
+            except UnicodeDecodeError:
+                if args.verbose: print(" (Skipping binary file)", file=sys.stderr)
+                continue
+        if m is not None:
+            # Find the first commit and use its date
+            commit = next(Repository(repo.working_tree_dir, filepath=file.path).traverse_commits())
+            found_copyright = True
+            start = str(commit.author_date.year)
+            orig_line = " {} {} {}".format(commit.hash, start, commit.msg.splitlines()[0])
+    else:
+        for i, line in enumerate(iter(file.data_stream[3].readline, '')):
+            if i >= args.lines: break
+            try:
+                line = line.decode('utf-8')
+            except UnicodeDecodeError:
+                if args.verbose: print(" (Skipping binary file)", file=sys.stderr)
+                break
+            m = copyright_pattern.search(line)
+            if m is not None:
+                found_copyright = True
+                orig_line = line
+                start = m.group(1)
+                end = m.group(2)
+                break
+    if found_copyright:
+        result = replace_copyright(abs_filepath, start, end)
+        if result:
+            replaced, before, after = result
+        if result and before != after:
+            copyrights_replaced += 1
+            if args.verbose: print(" (Copyright updated)", file=sys.stderr)
+            if args.verbose: print("<" + orig_line.rstrip('\n'), file=sys.stderr)
+            if args.verbose: print("-" + before.rstrip('\n'), file=sys.stderr)
+            if args.verbose: print("+" + after.rstrip('\n'), file=sys.stderr)
+        else:
+            if args.verbose: print(" (Copyright is the same)", file=sys.stderr)
+    else:
+        if args.verbose: print(" (No copyright found)", file=sys.stderr)
+if args.verbose or args.dry_run: print("{} copyrights replaced".format(copyrights_replaced), file=sys.stderr)
