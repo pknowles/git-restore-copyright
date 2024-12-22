@@ -13,11 +13,12 @@ from git import Repo
 copyright_pattern = re.compile(r'copyright\s*(?:©|\(c\))\s*(?P<start>[0-9]{4})(?:\s*\-\s*(?P<end>[0-9]{4}))?', re.I)
 
 parser = argparse.ArgumentParser(description='Mass-restore copyrights in a git repository')
-parser.add_argument('op', choices=['restore', 'undo', 'history'], help='Either "restore" copyright year(s) from this commit, "undo" its changes or replace them using the date from their first git "history" commit.')
+parser.add_argument('op', choices=['restore', 'undo', 'history', 'update'], help='Either "restore" copyright year(s) from this commit, "undo" its changes, replace them using the date from their first git "history" commit just "update" copyrights with the current year.')
 parser.add_argument('commit', help='Commit-ish to "restore" from or "undo". Only checks files indexed at this commit for "history".')
 parser.add_argument('-n', '--dry-run', action='store_true', help='Print the replacements that would have been made but do not modify the files.')
 parser.add_argument('-l', '--lines', nargs='?', default=10, type=int, help='Number of lines to search in file headers for a copyright notice with a year')
 parser.add_argument('-v', '--verbose', action='store_true', help='List the files that are being inspected')
+parser.add_argument('--filter', help='Regex that must match for a copyright to be altered')
 parser.add_argument('--expand-range', action='store_true', help='Rather than just restore "2023" to the original year "2014", replace it with a range covering all years, e.g. "2014 - 2023".')
 args = parser.parse_args()
 
@@ -28,6 +29,9 @@ assert not repo.is_dirty()
 def replace_copyright_line(line, start, end):
     # DANGER: stdout writes to the file. use stderr only
     new_line = line
+    if start == end:
+        # Don't create "2023-2023"
+        end = None
     m = copyright_pattern.search(line)
     if m is not None:
         if m.group(2) is None:
@@ -100,6 +104,12 @@ def tree_exists(tree, path):
     except KeyError:
         return False
 
+filterRegex = re.compile(args.filter, re.IGNORECASE) if args.filter else None
+def matchFilter(line):
+    if filterRegex:
+        return filterRegex.search(line) is not None
+    return True
+
 if args.op == 'history':
     # pydriller needed to follow file renames
     from pydriller import Repository
@@ -127,24 +137,36 @@ for file in files:
     start = None
     end = None
     orig_line = None
-    if args.op == 'history':
+    if args.op == 'history' or args.op == 'update':
         # First make sure the current file has a copyright
-        m = None
+        match = None
+        matched_line = None
         with open(abs_filepath) as ifile:
             try:
                 for i, line in enumerate(ifile):
                     if i >= args.lines: break
                     m = copyright_pattern.search(line)
-                    if m: break
+                    if m and matchFilter(line):
+                        match = m
+                        matched_line = line
+                        break
             except UnicodeDecodeError:
                 if args.verbose: print(" (Skipping binary file)", file=sys.stderr)
                 continue
-        if m is not None:
-            # Find the first commit and use its date
-            commit = next(Repository(repo.working_tree_dir, filepath=file.path).traverse_commits())
-            found_copyright = True
-            start = str(commit.author_date.year)
-            orig_line = " {} {} {}".format(commit.hash, start, commit.msg.splitlines()[0])
+        if match is not None:
+            if args.op == 'history':
+                # Find the first commit and use its date
+                commit = next(Repository(repo.working_tree_dir, filepath=file.path).traverse_commits())
+                found_copyright = True
+                start = str(commit.author_date.year)
+                orig_line = " {} {} {}".format(commit.hash, start, commit.msg.splitlines()[0])
+            else:
+                assert args.op == 'update'
+                found_copyright = True
+                start = m.group(1)
+                end = str(datetime.date.today().year)
+                assert matched_line is not None
+                orig_line = matched_line
     else:
         for i, line in enumerate(iter(file.data_stream[3].readline, '')):
             if i >= args.lines: break
@@ -154,7 +176,7 @@ for file in files:
                 if args.verbose: print(" (Skipping binary file)", file=sys.stderr)
                 break
             m = copyright_pattern.search(line)
-            if m is not None:
+            if m and matchFilter(line):
                 found_copyright = True
                 orig_line = line
                 start = m.group(1)
